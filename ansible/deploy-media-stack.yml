@@ -1,0 +1,293 @@
+---
+# Déploie la stack média (Jellyfin + Riven + Jellyseerr + Zilean + Prowlarr) via
+# Docker Compose. Par défaut cible localhost (déploiement local) — passer
+# -e target=mon-hote -e ansible_user=... pour cibler une autre machine (Docker
+# déjà installé dessus, ce playbook ne l'installe pas volontairement, portable
+# vers n'importe quelle distro/hôte).
+#
+# Usage :
+#   ansible-galaxy collection install -r requirements.yml
+#   cp ../.env.example ../.env && $EDITOR ../.env   # au moins ALLDEBRID_API_KEY,
+#                                                     # RIVEN_BACKEND_API_KEY, RIVEN_AUTH_SECRET
+#   ansible-playbook deploy-media-stack.yml
+#
+# Puis, une fois l'onboarding fait dans chaque UI (voir README §3) et .env
+# complété (JELLYFIN_API_KEY, PROWLARR_API_KEY, JELLYSEERR_API_KEY) :
+#   ansible-playbook deploy-media-stack.yml --tags guards
+#
+# Pour arrêter/supprimer la stack :
+#   ansible-playbook deploy-media-stack.yml -e media_stack_state=absent
+
+- name: Déployer la stack média localement via Docker Compose
+  hosts: "{{ target | default('localhost') }}"
+  connection: "{{ 'local' if (target | default('localhost')) == 'localhost' else 'ssh' }}"
+  gather_facts: true
+
+  vars:
+    project_dir: "{{ playbook_dir }}/.."
+    media_stack_state: present
+    env_file: "{{ project_dir }}/.env"
+
+  tasks:
+    - name: Vérifier que Docker est disponible sur la cible
+      ansible.builtin.command: docker info
+      register: docker_info
+      changed_when: false
+      failed_when: docker_info.rc != 0
+
+    - name: Vérifier la présence de .env
+      ansible.builtin.stat:
+        path: "{{ env_file }}"
+      register: dotenv
+
+    - name: Échouer si .env est absent (pas de valeurs par défaut à deviner)
+      ansible.builtin.fail:
+        msg: >-
+          {{ env_file }} introuvable — copie .env.example vers .env et renseigne
+          au moins ALLDEBRID_API_KEY (ou REALDEBRID_API_KEY), RIVEN_BACKEND_API_KEY
+          et RIVEN_AUTH_SECRET avant de lancer ce playbook (voir README §2-3).
+      when: not dotenv.stat.exists
+
+    - name: Parser .env en JSON
+      ansible.builtin.command: >-
+        python3 -c "import json,re,sys; d={}; [d.update({m.group(1): m.group(2)}) for line in open(sys.argv[1])
+        for m in [re.match(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', line.strip())] if m]; print(json.dumps(d))" "{{ env_file }}"
+      register: env_json
+      changed_when: false
+      when: dotenv.stat.exists
+
+    - name: Charger les variables de .env
+      ansible.builtin.set_fact:
+        env_vars: "{{ env_json.stdout | from_json }}"
+      when: dotenv.stat.exists
+
+    - name: Résoudre les chemins hôte (absolus, requis pour le bind rshared)
+      ansible.builtin.set_fact:
+        media_dir_abs: "{{ (project_dir ~ '/' ~ (env_vars.MEDIA_DIR | default('./data/media'))) | regex_replace('/\\./', '/') if not (env_vars.MEDIA_DIR | default('./data/media')).startswith('/') else env_vars.MEDIA_DIR }}"
+      when: dotenv.stat.exists
+
+    - name: Créer les répertoires de données (bind mounts)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ media_dir_abs }}"
+        - "{{ project_dir }}/{{ env_vars.JELLYFIN_CACHE_DIR | default('./data/jellyfin-cache') | regex_replace('^\\./', '') }}"
+        - "{{ project_dir }}/{{ env_vars.RIVEN_CACHE_DIR | default('./data/riven-cache') | regex_replace('^\\./', '') }}"
+      when:
+        - dotenv.stat.exists
+        - media_stack_state == 'present'
+
+    # RivenVFS (monté en FUSE par le conteneur riven) a besoin que ce point de
+    # montage soit "shared" côté hôte pour que le montage devienne visible dans
+    # le conteneur jellyfin (bind mount séparé du même chemin) — voir
+    # ARCHITECTURE.md "Le piège du montage média". Sans ce bind+rshared, Jellyfin
+    # verra un dossier vide même une fois du contenu téléchargé.
+    - name: Vérifier /dev/fuse (requis par RivenVFS)
+      ansible.builtin.stat:
+        path: /dev/fuse
+      register: fuse_dev
+      when: media_stack_state == 'present'
+
+    - name: Échouer si /dev/fuse est absent
+      ansible.builtin.fail:
+        msg: "/dev/fuse introuvable — le module FUSE doit être chargé sur l'hôte (modprobe fuse)."
+      when:
+        - media_stack_state == 'present'
+        - not fuse_dev.stat.exists
+
+    - name: Rendre le montage média "shared" (bind + rshared, idempotent)
+      become: true
+      when:
+        - dotenv.stat.exists
+        - media_stack_state == 'present'
+      block:
+        - name: Bind mount du répertoire média sur lui-même
+          ansible.posix.mount:
+            path: "{{ media_dir_abs }}"
+            src: "{{ media_dir_abs }}"
+            fstype: none
+            opts: bind
+            state: mounted
+
+        - name: Propagation rshared sur le montage média
+          ansible.builtin.command: mount --make-rshared {{ media_dir_abs }}
+          changed_when: true
+
+        - name: Vérifier la propagation rshared
+          ansible.builtin.command: findmnt -T {{ media_dir_abs }} -o TARGET,PROPAGATION
+          register: propagation_check
+          changed_when: false
+          failed_when: "'shared' not in propagation_check.stdout"
+
+    - name: (Dé)Déployer la stack média
+      community.docker.docker_compose_v2:
+        project_src: "{{ project_dir }}"
+        state: "{{ media_stack_state }}"
+        pull: "{{ 'always' if media_stack_state == 'present' else omit }}"
+      register: stack
+
+    - name: Attendre que riven-db soit prêt
+      community.docker.docker_container_exec:
+        container: riven-db
+        command: pg_isready -U postgres
+      register: pg_ready
+      retries: 30
+      delay: 5
+      until: pg_ready.rc == 0
+      when: media_stack_state == 'present'
+
+    # Filet de sécurité : l'image ipromknight/zilean testée ici crée sa propre
+    # base "zilean" au premier démarrage (connectée en tant que postgres/
+    # superuser) — cette tâche est un no-op dans ce cas. Gardée pour une image
+    # plus ancienne/future qui ne le ferait pas (Zilean crash-loop sans sa base).
+    # Idempotent (CREATE DATABASE IF NOT EXISTS n'existe pas nativement en SQL
+    # standard Postgres, on vérifie donc avant).
+    - name: Vérifier si la base "zilean" existe déjà
+      community.docker.docker_container_exec:
+        container: riven-db
+        command: psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='zilean'"
+      register: zilean_db_check
+      changed_when: false
+      when: media_stack_state == 'present'
+
+    - name: Créer la base "zilean" dans riven-db
+      community.docker.docker_container_exec:
+        container: riven-db
+        command: psql -U postgres -c "CREATE DATABASE zilean;"
+      when:
+        - media_stack_state == 'present'
+        - "'1' not in (zilean_db_check.stdout | default(''))"
+
+    - name: Redémarrer Zilean si sa base vient d'être créée
+      community.docker.docker_container:
+        name: zilean
+        state: started
+        restart: true
+      when:
+        - media_stack_state == 'present'
+        - "'1' not in (zilean_db_check.stdout | default(''))"
+
+    - name: État de la stack
+      ansible.builtin.debug:
+        msg:
+          - "✅ Jellyfin    → http://localhost:{{ env_vars.JELLYFIN_PORT | default('8096') }} (assistant de première config)"
+          - "✅ Riven back  → http://localhost:{{ env_vars.RIVEN_PORT | default('8080') }}"
+          - "✅ Riven front → http://localhost:{{ env_vars.RIVEN_FRONTEND_PORT | default('3000') }}"
+          - "✅ Prowlarr    → http://localhost:{{ env_vars.PROWLARR_PORT | default('9696') }}"
+          - "✅ Jellyseerr  → http://localhost:{{ env_vars.JELLYSEERR_PORT | default('5055') }}"
+          - "👉 Étapes suivantes : voir README.md §3 « Mise en route »"
+      when: media_stack_state == 'present'
+
+# ── Play optionnel : garde-fous (scripts/) en systemd timers ──────────────────
+# Ne peut tourner qu'une fois JELLYFIN_API_KEY / RIVEN_BACKEND_API_KEY (et
+# RIVEN_CACHE_DIR/JELLYFIN_CACHE_DIR/MEDIA_DIR, déjà dans .env) disponibles —
+# voir README §3. Lancer avec --tags guards une fois l'onboarding terminé.
+- name: Déployer les garde-fous (systemd timers)
+  hosts: "{{ target | default('localhost') }}"
+  connection: "{{ 'local' if (target | default('localhost')) == 'localhost' else 'ssh' }}"
+  become: true
+  tags: guards
+  gather_facts: false
+
+  vars:
+    project_dir: "{{ playbook_dir }}/.."
+    env_file: "{{ project_dir }}/.env"
+    guards:
+      - { name: riven-playback-guard, interval: "2min", boot: "2min" }
+      - { name: riven-stall-detector, interval: "15min", boot: "15min" }
+      - { name: riven-cache-cleanup, interval: "8h", boot: "20min" }
+      - { name: riven-episode-retry-guard, interval: "1h", boot: "10min" }
+      - { name: riven-ongoing-watchdog, interval: "30min", boot: "10min" }
+      - { name: jellyfin-disk-guard, interval: "15min", boot: "5min" }
+      - { name: jellyfin-scan-guard, interval: "1h", boot: "10min" }
+
+  tasks:
+    - name: Parser .env en JSON
+      ansible.builtin.command: >-
+        python3 -c "import json,re,sys; d={}; [d.update({m.group(1): m.group(2)}) for line in open(sys.argv[1])
+        for m in [re.match(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', line.strip())] if m]; print(json.dumps(d))" "{{ env_file }}"
+      register: env_json
+      changed_when: false
+
+    - name: Charger les variables de .env
+      ansible.builtin.set_fact:
+        env_vars: "{{ env_json.stdout | from_json }}"
+
+    - name: Échouer si les clés API requises manquent
+      ansible.builtin.fail:
+        msg: >-
+          JELLYFIN_API_KEY et/ou RIVEN_BACKEND_API_KEY absent(e)s de .env —
+          termine l'onboarding (README §3) et renseigne .env avant de déployer
+          les garde-fous.
+      when: >-
+        (env_vars.JELLYFIN_API_KEY | default('')) == '' or
+        (env_vars.RIVEN_BACKEND_API_KEY | default('')) == ''
+
+    - name: Déployer /etc/media-guards.env
+      ansible.builtin.copy:
+        dest: /etc/media-guards.env
+        mode: "0600"
+        content: |
+          JELLYFIN_URL=http://localhost:{{ env_vars.JELLYFIN_PORT | default('8096') }}
+          JELLYFIN_API_KEY={{ env_vars.JELLYFIN_API_KEY }}
+          RIVEN_URL=http://localhost:{{ env_vars.RIVEN_PORT | default('8080') }}
+          RIVEN_API_KEY={{ env_vars.RIVEN_BACKEND_API_KEY }}
+          MEDIA_DIR={{ project_dir }}/{{ env_vars.MEDIA_DIR | default('./data/media') | regex_replace('^\\./', '') }}
+          JELLYFIN_CACHE_DIR={{ project_dir }}/{{ env_vars.JELLYFIN_CACHE_DIR | default('./data/jellyfin-cache') | regex_replace('^\\./', '') }}
+          RIVEN_CACHE_DIR={{ project_dir }}/{{ env_vars.RIVEN_CACHE_DIR | default('./data/riven-cache') | regex_replace('^\\./', '') }}
+      no_log: true
+
+    - name: Copier les scripts de garde-fou
+      ansible.builtin.copy:
+        src: "../scripts/{{ item.name }}.py"
+        dest: "/usr/local/bin/{{ item.name }}.py"
+        mode: "0755"
+      loop: "{{ guards }}"
+
+    - name: Déployer les services systemd (oneshot)
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ item.name }}.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Media stack guard: {{ item.name }}
+          After=docker.service
+
+          [Service]
+          Type=oneshot
+          EnvironmentFile=/etc/media-guards.env
+          ExecStart=/usr/bin/python3 /usr/local/bin/{{ item.name }}.py
+      loop: "{{ guards }}"
+      notify: daemon-reload
+
+    - name: Déployer les timers systemd
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ item.name }}.timer"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Timer for {{ item.name }}
+
+          [Timer]
+          OnBootSec={{ item.boot }}
+          OnUnitActiveSec={{ item.interval }}
+
+          [Install]
+          WantedBy=timers.target
+      loop: "{{ guards }}"
+      notify: daemon-reload
+
+    - name: Activer et démarrer les timers
+      ansible.builtin.systemd:
+        name: "{{ item.name }}.timer"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop: "{{ guards }}"
+
+  handlers:
+    - name: daemon-reload
+      ansible.builtin.systemd:
+        daemon_reload: true
