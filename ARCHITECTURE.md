@@ -3,158 +3,121 @@
 ## Vue d'ensemble
 
 ```mermaid
-flowchart TB
-    subgraph CLIENT["Toi"]
-        BROWSER[Navigateur / app Jellyfin]
-    end
+flowchart LR
+  U[Utilisateurs] -->|demande| SEERR[Seerr]
+  U -->|lecture| JF[Jellyfin]
 
-    subgraph EXT["Services externes"]
-        TORRENTIO[Torrentio]
-        DEBRID["AllDebrid / Real-Debrid\n(compte payant, obligatoire)"]
-    end
+  SEERR -->|film| RAD[Radarr]
+  SEERR -->|série| SON[Sonarr]
+  PROW[Prowlarr] -->|indexeurs| RAD & SON
+  FS[FlareSolverr<br/>optionnel] -.-> PROW
 
-    subgraph STACK["docker-compose.yml — un seul hôte"]
-        JELLYSEERR["Jellyseerr :5055\nCatalogue + demandes"]
-        JELLYFIN["Jellyfin :8096\nLecture, transcodage"]
-        RIVENFE["Riven frontend :3000\nAdmin bibliothèque"]
-        RIVENBE["Riven backend :8080\nScraping + téléchargement"]
-        ZILEAN["Zilean :8181\nIndex hashlists DMM"]
-        PROWLARR["Prowlarr :9696\nAgrégateur indexeurs torrent"]
-        PG[("PostgreSQL\nriven-db")]
-        MEDIA[["MEDIA_DIR\n(bind + rshared)"]]
-    end
+  RAD & SON -->|API qBittorrent| DEC[Decypharr]
+  DEC -->|magnet| DEB[(Débrideur)]
+  DEB -->|fichiers| DEC
 
-    BROWSER -->|catalogue, demande un titre| JELLYSEERR
-    BROWSER -->|regarde| JELLYFIN
-
-    JELLYSEERR -->|"content service\n(API compatible Overseerr)"| RIVENBE
-    RIVENFE -->|admin uniquement| RIVENBE
-
-    RIVENBE --> PG
-    RIVENBE -->|scrape| TORRENTIO
-    RIVENBE -->|scrape| ZILEAN
-    RIVENBE -->|scrape| PROWLARR
-    ZILEAN --> PG
-    RIVENBE -->|télécharge| DEBRID
-    DEBRID -->|montage FUSE RivenVFS| MEDIA
-    MEDIA -->|lecture seule| JELLYFIN
-    RIVENBE -->|"scan bibliothèque\n(API updater)"| JELLYFIN
-
-    classDef ext fill:#94a3b8,color:#fff,stroke:#64748b
-    class TORRENTIO,DEBRID ext
+  DEC -->|montage FUSE| REMOTE[/data/remote/]
+  DEC -->|liens symboliques| SYM[/data/symlinks/]
+  SYM -->|import| LIB[/data/media/]
+  LIB --> JF
+  BAZ[Bazarr] -->|sous-titres| LIB
 ```
+
+Aucun fichier vidéo n'est stocké localement. Le débrideur garde les fichiers ; Decypharr
+les expose en système de fichiers (FUSE) ; la bibliothèque n'est faite que de liens
+symboliques vers ce montage.
 
 ## Rôle de chaque service
 
-| Service | Image | Rôle | Brique |
-|---|---|---|---|
-| **[Jellyfin](https://jellyfin.org)** | `jellyfin/jellyfin` | Serveur média : sert le catalogue, transcode à la volée (VAAPI matériel en option), gère les comptes/profils. C'est l'app que tu ouvres pour *regarder*. | Lecture |
-| **[Jellyseerr](https://github.com/fallenbagel/jellyseerr)** | `fallenbagel/jellyseerr` | Interface de demande type Netflix (catalogue TMDB, login délégué à Jellyfin). C'est l'app que tu ouvres pour *demander* un film/série pas encore dans la bibliothèque. | Demande |
-| **[Riven](https://github.com/rivenmedia/riven) — backend** | `spoked/riven` | Cœur du pipeline : reçoit les demandes (Jellyseerr, ou directement via son propre frontend), scrape les sources, envoie au débrideur, expose le résultat en tant que filesystem (RivenVFS), notifie Jellyfin. | Orchestration |
-| **Riven — frontend** | `spoked/riven-frontend` | UI admin de Riven (état des items, retry manuel, réglages). Pas destinée aux utilisateurs finaux — eux passent par Jellyseerr. | Administration |
-| **PostgreSQL** | `postgres:17-alpine` | Base de données de Riven (état des items, historique) **et** de Zilean (deux bases séparées, `riven` + `zilean`, même instance). | Stockage d'état |
-| **[Zilean](https://github.com/iPromKnight/zilean)** | `ipromknight/zilean` | Indexe les hashlists DMM (Debrid Media Manager) — un deuxième vivier de sources de scraping en plus de Torrentio/Prowlarr, pour élargir les résultats. | Source de scraping |
-| **[Prowlarr](https://github.com/Prowlarr/Prowlarr)** | `lscr.io/linuxserver/prowlarr` | Agrégateur d'indexeurs torrent (indexeurs publics, aucun compte requis pour démarrer). Fournit à Riven une troisième source de scraping, configurable finement (quels indexeurs, quels filtres). | Source de scraping |
-| **[Torrentio](https://torrentio.strem.fun)** | *(service externe, pas un conteneur)* | Agrégateur de sources torrent public, interrogé directement par Riven via son API. Aucune configuration requise. | Source de scraping |
-| **AllDebrid / Real-Debrid** | *(service externe, pas un conteneur)* | Débrideur cloud : télécharge et héberge le fichier réel, Riven l'expose ensuite en local via RivenVFS. **Compte payant obligatoire** (~4€/mois) — sans ça, Riven trouve des sources mais ne peut rien télécharger. | Stockage réel des fichiers |
-
-## Le piège du montage média
-
-C'est la partie la plus fragile de toute la stack, et la cause la plus probable
-si "tout tourne mais Jellyfin ne voit aucun fichier".
-
-**Le principe** : Riven ne stocke rien lui-même. Il monte la bibliothèque du
-débrideur en local via **RivenVFS**, un filesystem FUSE qui streame à la
-demande. Ce montage FUSE est créé *à l'intérieur* du conteneur `riven`. Pour
-que le conteneur `jellyfin` (un processus complètement séparé) puisse voir ces
-fichiers, il faut que le montage soit propagé jusqu'à l'hôte, puis re-monté
-dans le conteneur `jellyfin`.
-
-**Comment ça marche ici** :
-
-1. `MEDIA_DIR` (répertoire hôte, ex. `./data/media`) est transformé en point de
-   montage "partagé" (`mount --bind` sur lui-même, puis `mount --make-rshared`)
-   — fait une fois par `make init` / `ansible-playbook ... ` / manuellement
-   (`scripts/prepare-media-mount.sh`), voir README §2.
-2. Le conteneur `riven` monte ce même chemin avec l'option `rshared` dans
-   `docker-compose.yml` (`${MEDIA_DIR}:/mount:rshared`) et y crée son montage
-   FUSE (`RIVEN_FILESYSTEM_MOUNT_PATH=/mount/vfs`). Grâce à `rshared`, ce
-   sous-montage se propage jusqu'à l'hôte.
-3. Le conteneur `jellyfin` monte le **même** `MEDIA_DIR` en lecture seule
-   (`${MEDIA_DIR}:/media:ro`) — comme le montage est déjà partagé au niveau de
-   l'hôte, Jellyfin voit directement le contenu de RivenVFS.
-
-**Pourquoi `/mount/vfs` et pas `/mount` directement** : Riven démonte puis
-remonte son `mount_path` au démarrage — le faire directement sur le point de
-montage racine casse la propagation vers l'hôte. Le sous-répertoire évite le
-problème.
-
-**Persistance au reboot** : la voie Ansible (`ansible.posix.mount`, `state:
-mounted`) écrit une entrée dans `/etc/fstab` pour que ce bind mount survive à
-un redémarrage de l'hôte — voulu, mais à savoir si tu supprimes le projet un
-jour : `sudo sed -i '\|<chemin du projet>|d' /etc/fstab` avant de faire le
-ménage, sinon `/etc/fstab` référence un chemin qui n'existe plus (inoffensif
-au boot suivant, juste un warning systemd, mais autant nettoyer). La voie
-`make`/shell (`scripts/prepare-media-mount.sh`) ne touche pas `/etc/fstab` —
-à relancer manuellement après un reboot si tu ne passes pas par Ansible.
-
-**Si Jellyfin ne voit rien après un `docker compose up -d`** : le montage FUSE
-peut apparaître *après* que Jellyfin a démarré et fait son premier scan, selon
-l'ordre de démarrage réel. `docker-compose.yml` a un `depends_on: riven:
-condition: service_healthy` sur `jellyfin` pour limiter ce risque, mais si ça
-arrive quand même : `docker compose restart jellyfin` suffit — pas besoin de
-tout redéployer.
-
-**Prérequis** : `/dev/fuse` doit exister sur l'hôte (module `fuse` chargé —
-`modprobe fuse` si besoin) ; le conteneur `riven` tourne avec `cap_add:
-SYS_ADMIN` + `security_opt: apparmor:unconfined`, requis par RivenVFS, sans
-alternative connue à ce jour.
-
-## Deux temps de déploiement
-
-Certaines valeurs de `.env` n'existent qu'*après* le premier démarrage de
-chaque service (clé API générée dans son UI). Le déploiement se fait donc en
-deux passes :
-
-1. **Premier `docker compose up -d`** avec juste les secrets qui ne dépendent
-   de rien (`RIVEN_BACKEND_API_KEY`, `RIVEN_AUTH_SECRET`, clé débrideur) — les
-   services démarrent, chacun affiche son assistant de première configuration.
-2. **Onboarding dans chaque UI** (voir README §3), report des clés générées
-   dans `.env`, puis `docker compose up -d` à nouveau pour les propager.
-
-Les garde-fous (`scripts/`, `make guards`) ne peuvent être installés qu'après
-cette deuxième passe — ils dépendent de `JELLYFIN_API_KEY` et
-`RIVEN_BACKEND_API_KEY`.
-
-## Garde-fous (`scripts/`)
-
-Riven et Jellyfin, sous charge réelle, ont quelques angles morts connus
-(items qui restent bloqués sans jamais retenter, cache qui grossit sans
-limite, montage temporairement indisponible pendant un scan...). Les scripts
-de `scripts/` sont des correctifs opérationnels indépendants, installés comme
-timers systemd sur l'hôte (pas dans les conteneurs) :
-
-| Script | Fréquence | Corrige |
+| Service | Rôle | Pourquoi lui |
 |---|---|---|
-| `riven-playback-guard.py` | 2 min | Met en pause le scraping/téléchargement en arrière-plan pendant une lecture active, pour ne pas saturer la connexion au débrideur pendant que quelqu'un regarde. |
-| `riven-stall-detector.py` | 15 min | Détecte un figement interne silencieux de Riven (healthcheck HTTP OK mais plus aucune activité) et redémarre le conteneur si nécessaire. |
-| `riven-cache-cleanup.py` | 8 h | Vide périodiquement le cache disque RivenVFS (sauf lecture en cours) pour borner le risque de cache corrompu. |
-| `riven-episode-retry-guard.py` | 1 h | Relance les épisodes individuels bloqués en `Requested` — le scheduler natif de Riven ne retente que movie/show, jamais les épisodes. |
-| `riven-ongoing-watchdog.py` | 30 min | Relance, avec backoff progressif, tout item bloqué en `Unknown`/`Indexed`/`Scraped` depuis plus de 30 min. |
-| `jellyfin-disk-guard.py` | 15 min | Purge le cache de transcodage Jellyfin si le disque dépasse 80% d'usage. |
-| `jellyfin-scan-guard.py` | 1 h | Vérifie que le montage média est sain avant d'autoriser un scan de bibliothèque — évite qu'une coupure débrideur temporaire soit interprétée comme des fichiers supprimés. |
+| **Jellyfin** | Lecture, transcodage, comptes utilisateurs | Libre, sans compte en ligne |
+| **Seerr** | Interface de demande, connexion avec les comptes Jellyfin | Successeur officiel de Jellyseerr et d'Overseerr |
+| **Radarr / Sonarr** | Gestion des bibliothèques films / séries : recherche, profils de qualité, renommage, import | Standard de fait, très documentés |
+| **Prowlarr** | Gère les indexeurs à un seul endroit et les pousse dans Radarr/Sonarr | Évite de configurer chaque indexeur deux fois |
+| **Bazarr** | Sous-titres automatiques | S'appuie sur Radarr/Sonarr pour savoir quoi chercher |
+| **Decypharr** | Se fait passer pour qBittorrent auprès des *arr, envoie les magnets au débrideur, monte sa bibliothèque et crée les liens | Montage, réparation et nettoyage de file intégrés : pas de rclone ni de scripts à part |
+| **FlareSolverr** | Contourne les protections anti-bot de certains indexeurs | Optionnel (profil Compose) |
 
-Détail de chaque script en tête de son fichier. Installation : `make guards`
-ou `ansible-playbook ansible/deploy-media-stack.yml --tags guards`.
+## Arborescence
+
+Tous les conteneurs qui manipulent des fichiers voient le même répertoire hôte
+(`DATA_DIR`) au **même chemin**, `/data` :
+
+```
+/data/remote      montage FUSE du débrideur (Decypharr)
+/data/symlinks    téléchargements terminés : liens vers /data/remote/...
+/data/media/movies  bibliothèque films (Radarr) : liens importés + sous-titres
+/data/media/tv      bibliothèque séries (Sonarr)
+```
+
+Un lien symbolique contient un chemin absolu. S'il pointe vers `/data/remote/...`, ce
+chemin doit exister à l'identique dans chaque conteneur qui le lit, sinon le lien est
+cassé. C'est la raison du chemin unique.
+
+Le chemin unique garantit aussi que `symlinks/` et `media/` sont sur le même système de
+fichiers. À l'import, Radarr et Sonarr déplacent le lien ou en font un lien dur, ce qui
+laisse un simple lien symbolique. Si le lien dur est impossible (deux systèmes de fichiers
+différents), ils se rabattent sur une copie, qui télécharge le fichier en entier.
+
+## Le piège du montage
+
+Le montage FUSE est créé **à l'intérieur** du conteneur Decypharr. Par défaut, un montage
+créé dans un conteneur reste invisible partout ailleurs : Jellyfin et les *arr verraient
+un dossier `remote/` vide, sans aucune erreur.
+
+Pour qu'il se propage, il faut trois choses :
+
+1. **Côté hôte**, `DATA_DIR` doit être un point de montage en propagation *shared*.
+   `make init` fait un bind mount du dossier sur lui-même puis `mount --make-rshared`.
+2. **Decypharr** monte `/data` en `rshared` : son montage FUSE remonte vers l'hôte.
+3. **Les autres conteneurs** montent `/data` en `rslave` : ils reçoivent les montages de
+   l'hôte, sans pouvoir en créer eux-mêmes.
+
+La propagation n'est pas mémorisée par `fstab`. Après un redémarrage de l'hôte, relance
+`make init`, ou installe l'unité systemd `media-stack-rshared.service`, que le playbook
+Ansible déploie.
+
+`make up` vérifie la propagation avant de démarrer et refuse de lancer la stack si elle
+n'est pas en place.
+
+## Conseils d'exploitation
+
+Ils viennent de problèmes réels rencontrés avec ce type de stack.
+
+- **Lire un fichier sur le montage n'est jamais gratuit.** Chaque lecture peut déclencher
+  un téléchargement depuis le débrideur. Un script qui « vérifie » la bibliothèque en
+  lisant quelques octets de chaque fichier peut générer des centaines de Mbit/s en
+  continu. Pour les fichiers morts, utilise la réparation intégrée de Decypharr
+  (quotidienne par défaut, voir `repair` dans la config) plutôt qu'un scanner maison.
+- **Dans Jellyfin, désactive tout ce qui lit les fichiers en entier** sur ces
+  bibliothèques : génération de trickplay et extraction des images de chapitres. Sinon,
+  chaque film est téléchargé une fois de plus au scan.
+- **Préfère les notifications aux scans planifiés.** Dans Radarr et Sonarr, *Settings →
+  Connect → Jellyfin* prévient Jellyfin à chaque import. Si le débrideur est indisponible
+  pendant un scan planifié, Jellyfin peut retirer de sa bibliothèque des éléments qu'il
+  croit supprimés.
+- **Ne fais jamais passer le débrideur par un VPN.** Si tu routes les indexeurs par un VPN
+  ou un proxy, exclus explicitement les domaines du débrideur. La plupart des débrideurs
+  bloquent les IP de VPN et de datacenter, et peuvent suspendre le compte.
+- **N'expose que Jellyfin et Seerr**, derrière un reverse proxy en HTTPS. Radarr, Sonarr,
+  Prowlarr, Bazarr et Decypharr sont des interfaces d'administration : garde-les sur le
+  réseau local ou derrière un VPN, et active l'authentification de Decypharr
+  (*Settings → Auth*) si l'hôte n'est pas isolé.
+- **Épingle la version de Decypharr** (`DECYPHARR_TAG`) une fois que tout fonctionne : le
+  projet est jeune et change vite.
+
+## Pourquoi pas Riven (v1)
+
+La v1 de ce dépôt (tag [`v1-riven`](../../tree/v1-riven)) reposait sur Riven, un
+orchestrateur tout-en-un. Il a été abandonné par ses mainteneurs, demandait des correctifs
+du code source et une série de scripts de surveillance pour rester stable. Radarr et Sonarr
+sont moins originaux, mais maintenus, largement utilisés et documentés : beaucoup moins de
+code à maintenir soi-même.
 
 ## Références
 
-- [Jellyfin](https://jellyfin.org) — [doc](https://jellyfin.org/docs/) · [image Docker](https://hub.docker.com/r/jellyfin/jellyfin)
-- [Riven](https://github.com/rivenmedia/riven) — [image Docker (`spoked/riven`)](https://hub.docker.com/r/spoked/riven)
-- [Jellyseerr](https://github.com/fallenbagel/jellyseerr)
-- [Zilean](https://github.com/iPromKnight/zilean)
-- [Prowlarr](https://github.com/Prowlarr/Prowlarr)
-- [Torrentio](https://torrentio.strem.fun)
-- [AllDebrid](https://alldebrid.com) · [Real-Debrid](https://real-debrid.com)
-- [Docker Compose](https://docs.docker.com/compose/)
-- [Ansible `community.docker`](https://docs.ansible.com/ansible/latest/collections/community/docker/) — module [`docker_compose_v2`](https://docs.ansible.com/ansible/latest/collections/community/docker/docker_compose_v2_module.html)
+- [Decypharr](https://github.com/sirrobot01/decypharr) · [Seerr](https://github.com/seerr-team/seerr)
+- [Radarr](https://radarr.video) · [Sonarr](https://sonarr.tv) · [Prowlarr](https://prowlarr.com) · [Bazarr](https://www.bazarr.media)
+- [Jellyfin](https://jellyfin.org) · [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr)
+- Propagation des montages Docker : [bind propagation](https://docs.docker.com/engine/storage/bind-mounts/#configure-bind-propagation)

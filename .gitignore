@@ -1,2 +1,4 @@
 .env
 data/
+config/decypharr/*
+!config/decypharr/config.json.example

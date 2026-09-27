@@ -1,0 +1,46 @@
+{
+  "port": "8282",
+  "log_level": "info",
+  "use_auth": false,
+
+  "debrids": [
+    {
+      "provider": "alldebrid",
+      "name": "debrid",
+      "api_key": "",
+      "download_uncached": false,
+      "rate_limit": "200/minute"
+    }
+  ],
+
+  "download_folder": "/data/symlinks",
+  "categories": ["radarr", "sonarr"],
+  "default_download_action": "symlink",
+  "max_active_downloads": 5,
+
+  "mount": {
+    "type": "dfs",
+    "mount_path": "/data/remote",
+    "dfs": {
+      "cache_dir": "/cache/dfs",
+      "chunk_size": "10MB",
+      "disk_cache_size": "20GB",
+      "cache_expiry": "24h",
+      "cache_cleanup_interval": "1h",
+      "uid": 1000,
+      "gid": 1000,
+      "umask": "022",
+      "allow_other": true
+    }
+  },
+
+  "repair": {
+    "enabled": true,
+    "source": "arr",
+    "schedule": "0 4 * * *",
+    "workers": 2,
+    "strategy": "per_entry",
+    "recheck_interval": "168h",
+    "auto_repair": true
+  }
+}
